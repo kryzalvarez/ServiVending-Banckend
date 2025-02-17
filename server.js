@@ -3,6 +3,8 @@ const express = require("express");
 const axios = require("axios");
 const cors = require("cors");
 const bodyParser = require("body-parser");
+const admin = require("firebase-admin");
+const path = require("path");
 
 const app = express();
 app.use(cors());
@@ -13,8 +15,14 @@ const PORT = process.env.PORT || 3000;
 // Datos de MercadoPago (usa tus credenciales)
 const MERCADOPAGO_ACCESS_TOKEN = process.env.MERCADOPAGO_ACCESS_TOKEN;
 
-// Simulación de base de datos en memoria
-let transactions = {};
+// Inicializa Firebase
+const serviceAccount = path.join(__dirname, 'config/serviceAccountKey.json'); // Ruta al archivo JSON de Firebase
+admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+    databaseURL: "https://your-database-name.firebaseio.com" // URL de tu base de datos de Firebase
+});
+
+const db = admin.firestore();
 
 // Ruta para generar un pago y código QR
 app.post("/create-payment", async (req, res) => {
@@ -30,7 +38,6 @@ app.post("/create-payment", async (req, res) => {
                 unit_price: item.price
             })),
             external_reference: machine_id,
-            // Aquí se configura la URL del webhook
             notification_url: `${process.env.WEBHOOK_URL}/payment-webhook` // URL del webhook de pago
         };
 
@@ -41,12 +48,13 @@ app.post("/create-payment", async (req, res) => {
             }
         });
 
-        // Guardar la transacción temporalmente
-        transactions[response.data.id] = {
+        // Guardar la transacción en Firebase
+        const transactionRef = db.collection('transactions').doc(response.data.id);
+        await transactionRef.set({
             machine_id,
             status: "pending",
             items
-        };
+        });
 
         res.json({ payment_url: response.data.init_point, qr_data: response.data.id });
     } catch (error) {
@@ -61,26 +69,19 @@ app.post("/payment-webhook", async (req, res) => {
         const paymentData = req.body;
         const prefId = paymentData.data.id; // Este es el pref_id o qr_data recibido
 
-        if (transactions[prefId]) {
-            // Consultar el estado de la preferencia de pago en MercadoPago
-            const response = await axios.get(`https://api.mercadopago.com/v1/payments/search`, {
-                headers: {
-                    "Authorization": `Bearer ${MERCADOPAGO_ACCESS_TOKEN}`
-                },
-                params: {
-                    "preference_id": prefId
-                }
-            });
+        const transactionRef = db.collection('transactions').doc(prefId);
+        const doc = await transactionRef.get();
 
-            const paymentStatus = response.data.results[0]?.status;
+        if (doc.exists) {
+            const paymentStatus = paymentData.data.status;
 
             // Si el pago fue aprobado, actualizar el estado
             if (paymentStatus === 'approved') {
-                transactions[prefId].status = "paid";
-                console.log(`Pago confirmado para la máquina ${transactions[prefId].machine_id}`);
+                await transactionRef.update({ status: "paid" });
+                console.log(`Pago confirmado para la máquina ${doc.data().machine_id}`);
             } else {
-                transactions[prefId].status = "failed";
-                console.log(`Pago fallido para la máquina ${transactions[prefId].machine_id}`);
+                await transactionRef.update({ status: "failed" });
+                console.log(`Pago fallido para la máquina ${doc.data().machine_id}`);
             }
         }
 
@@ -92,9 +93,16 @@ app.post("/payment-webhook", async (req, res) => {
 });
 
 // Ruta para verificar el estado de una transacción
-app.get("/transaction-status/:transaction_id", (req, res) => {
+app.get("/transaction-status/:transaction_id", async (req, res) => {
     const { transaction_id } = req.params;
-    res.json(transactions[transaction_id] || { error: "Transacción no encontrada" });
+    const transactionRef = db.collection('transactions').doc(transaction_id);
+    const doc = await transactionRef.get();
+
+    if (doc.exists) {
+        res.json(doc.data());
+    } else {
+        res.json({ error: "Transacción no encontrada" });
+    }
 });
 
 // Iniciar el servidor
